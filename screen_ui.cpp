@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "screen_ui.h"
+
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -29,18 +31,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <android-base/logging.h>
 #include <android-base/properties.h>
-#include <android-base/strings.h>
 #include <android-base/stringprintf.h>
+#include <android-base/strings.h>
+#include <minui/minui.h>
 
 #include "common.h"
 #include "device.h"
-#include "minui/minui.h"
-#include "screen_ui.h"
 #include "ui.h"
 
 // Return the current time as a double (including fractions of a second).
@@ -54,7 +57,7 @@ ScreenRecoveryUI::ScreenRecoveryUI()
     : kMarginWidth(RECOVERY_UI_MARGIN_WIDTH),
       kMarginHeight(RECOVERY_UI_MARGIN_HEIGHT),
       kAnimationFps(RECOVERY_UI_ANIMATION_FPS),
-      density_(static_cast<float>(android::base::GetIntProperty("ro.sf.lcd_density", 160)) / 160.f),
+      kDensity(static_cast<float>(android::base::GetIntProperty("ro.sf.lcd_density", 160)) / 160.f),
       currentIcon(NONE),
       progressBarType(EMPTY),
       progressScopeStart(0),
@@ -80,6 +83,8 @@ ScreenRecoveryUI::ScreenRecoveryUI()
       intro_done(false),
       stage(-1),
       max_stage(-1),
+      locale_(""),
+      rtl_locale_(false),
       updateMutex(PTHREAD_MUTEX_INITIALIZER) {}
 
 GRSurface* ScreenRecoveryUI::GetCurrentFrame() const {
@@ -105,7 +110,7 @@ GRSurface* ScreenRecoveryUI::GetCurrentText() const {
 }
 
 int ScreenRecoveryUI::PixelsFromDp(int dp) const {
-  return dp * density_;
+  return dp * kDensity;
 }
 
 // Here's the intended layout:
@@ -254,6 +259,81 @@ void ScreenRecoveryUI::SetColor(UIElement e) const {
       gr_color(255, 255, 255, 255);
       break;
   }
+}
+
+void ScreenRecoveryUI::SelectAndShowBackgroundText(const std::vector<std::string>& locales_entries,
+                                                   size_t sel) {
+  SetLocale(locales_entries[sel]);
+  std::vector<std::string> text_name = { "erasing_text", "error_text", "installing_text",
+                                         "installing_security_text", "no_command_text" };
+  std::unordered_map<std::string, std::unique_ptr<GRSurface, decltype(&free)>> surfaces;
+  for (const auto& name : text_name) {
+    GRSurface* text_image = nullptr;
+    LoadLocalizedBitmap(name.c_str(), &text_image);
+    if (!text_image) {
+      Print("Failed to load %s\n", name.c_str());
+      return;
+    }
+    surfaces.emplace(name, std::unique_ptr<GRSurface, decltype(&free)>(text_image, &free));
+  }
+
+  pthread_mutex_lock(&updateMutex);
+  gr_color(0, 0, 0, 255);
+  gr_clear();
+
+  int text_y = kMarginHeight;
+  int text_x = kMarginWidth;
+  int line_spacing = gr_sys_font()->char_height;  // Put some extra space between images.
+  // Write the header and descriptive texts.
+  SetColor(INFO);
+  std::string header = "Show background text image";
+  text_y += DrawTextLine(text_x, text_y, header.c_str(), true);
+  std::string locale_selection = android::base::StringPrintf(
+      "Current locale: %s, %zu/%zu", locales_entries[sel].c_str(), sel, locales_entries.size());
+  const char* instruction[] = { locale_selection.c_str(),
+                                "Use volume up/down to switch locales and power to exit.",
+                                nullptr };
+  text_y += DrawWrappedTextLines(text_x, text_y, instruction);
+
+  // Iterate through the text images and display them in order for the current locale.
+  for (const auto& p : surfaces) {
+    text_y += line_spacing;
+    SetColor(LOG);
+    text_y += DrawTextLine(text_x, text_y, p.first.c_str(), false);
+    gr_color(255, 255, 255, 255);
+    gr_texticon(text_x, text_y, p.second.get());
+    text_y += gr_get_height(p.second.get());
+  }
+  // Update the whole screen.
+  gr_flip();
+  pthread_mutex_unlock(&updateMutex);
+}
+
+void ScreenRecoveryUI::CheckBackgroundTextImages(const std::string& saved_locale) {
+  // Load a list of locales embedded in one of the resource files.
+  std::vector<std::string> locales_entries = get_locales_in_png("installing_text");
+  if (locales_entries.empty()) {
+    Print("Failed to load locales from the resource files\n");
+    return;
+  }
+  size_t selected = 0;
+  SelectAndShowBackgroundText(locales_entries, selected);
+
+  FlushKeys();
+  while (true) {
+    int key = WaitKey();
+    if (key == KEY_POWER || key == KEY_ENTER) {
+      break;
+    } else if (key == KEY_UP || key == KEY_VOLUMEUP) {
+      selected = (selected == 0) ? locales_entries.size() - 1 : selected - 1;
+      SelectAndShowBackgroundText(locales_entries, selected);
+    } else if (key == KEY_DOWN || key == KEY_VOLUMEDOWN) {
+      selected = (selected == locales_entries.size() - 1) ? 0 : selected + 1;
+      SelectAndShowBackgroundText(locales_entries, selected);
+    }
+  }
+
+  SetLocale(saved_locale);
 }
 
 int ScreenRecoveryUI::DrawHorizontalRule(int y) const {
@@ -497,6 +577,7 @@ bool ScreenRecoveryUI::InitTextParams() {
 
 bool ScreenRecoveryUI::Init(const std::string& locale) {
   RecoveryUI::Init(locale);
+
   if (!InitTextParams()) {
     return false;
   }
@@ -511,6 +592,9 @@ bool ScreenRecoveryUI::Init(const std::string& locale) {
 
   text_col_ = text_row_ = 0;
   text_top_ = 1;
+
+  // Set up the locale info.
+  SetLocale(locale);
 
   LoadBitmap("icon_error", &error_icon);
 
@@ -840,4 +924,24 @@ void ScreenRecoveryUI::KeyLongPress(int) {
   // Redraw so that if we're in the menu, the highlight
   // will change color to indicate a successful long press.
   Redraw();
+}
+
+void ScreenRecoveryUI::SetLocale(const std::string& new_locale) {
+  locale_ = new_locale;
+  rtl_locale_ = false;
+
+  if (!new_locale.empty()) {
+    size_t underscore = new_locale.find('_');
+    // lang has the language prefix prior to '_', or full string if '_' doesn't exist.
+    std::string lang = new_locale.substr(0, underscore);
+
+    // A bit cheesy: keep an explicit list of supported RTL languages.
+    if (lang == "ar" ||  // Arabic
+        lang == "fa" ||  // Persian (Farsi)
+        lang == "he" ||  // Hebrew (new language code)
+        lang == "iw" ||  // Hebrew (old language code)
+        lang == "ur") {  // Urdu
+      rtl_locale_ = true;
+    }
+  }
 }

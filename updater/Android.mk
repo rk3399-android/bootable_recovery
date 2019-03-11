@@ -48,6 +48,8 @@ updater_common_static_libraries := \
     libcutils \
     libtune2fs \
     libbrotli \
+    librkupdate  \
+    libext2_uuid \
     $(tune2fs_static_libraries)
 
 # libupdater (static library)
@@ -58,6 +60,7 @@ LOCAL_MODULE := libupdater
 
 LOCAL_SRC_FILES := \
     install.cpp \
+    ../rktools.cpp \
     blockimg.cpp
 
 LOCAL_C_INCLUDES := \
@@ -84,11 +87,13 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := updater
 
 LOCAL_SRC_FILES := \
-    updater.cpp
+    updater.cpp \
+    ../roots.cpp
 
 LOCAL_C_INCLUDES := \
     $(LOCAL_PATH)/.. \
-    $(LOCAL_PATH)/include
+    $(LOCAL_PATH)/include \
+    system/vold
 
 LOCAL_CFLAGS := \
     -Wno-unused-parameter \

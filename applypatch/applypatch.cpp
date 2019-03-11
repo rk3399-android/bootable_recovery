@@ -41,6 +41,7 @@
 #include "edify/expr.h"
 #include "ota_io.h"
 #include "print_sha1.h"
+#include "rktools.h"
 
 static int LoadPartitionContents(const std::string& filename, FileContents* file);
 static size_t FileSink(const unsigned char* data, size_t len, int fd);
@@ -99,6 +100,10 @@ static int LoadPartitionContents(const std::string& filename, FileContents* file
     return -1;
   }
 
+  std::string result;
+  SplitString(pieces[1], result, "/");
+  pieces[1] = result;
+
   size_t pair_count = (pieces.size() - 2) / 2;  // # of (size, sha1) pairs in filename
   std::vector<std::pair<size_t, std::string>> pairs;
   for (size_t i = 0; i < pair_count; ++i) {
@@ -112,7 +117,6 @@ static int LoadPartitionContents(const std::string& filename, FileContents* file
 
   // Sort the pairs array so that they are in order of increasing size.
   std::sort(pairs.begin(), pairs.end());
-
   const char* partition = pieces[1].c_str();
   unique_file dev(ota_fopen(partition, "rb"));
   if (!dev) {
@@ -232,6 +236,10 @@ int WriteToPartition(const unsigned char* data, size_t len, const std::string& t
     printf("WriteToPartition called with bad target (%s)\n", target.c_str());
     return -1;
   }
+
+  std::string result;
+  SplitString(pieces[1], result, "/");
+  pieces[1] = result;
 
   const char* partition = pieces[1].c_str();
   unique_fd fd(ota_open(partition, O_RDWR));

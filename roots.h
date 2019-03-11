@@ -51,4 +51,6 @@ int format_volume(const char* volume, const char* directory);
 // mounted (/tmp and /cache) are mounted.  Returns 0 on success.
 int setup_install_mounts();
 
+int is_path_mounted(const char* mount_point);
+
 #endif  // RECOVERY_ROOTS_H_

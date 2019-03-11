@@ -39,6 +39,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <fs_mgr.h>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -73,6 +74,10 @@
 #include "screen_ui.h"
 #include "stub_ui.h"
 #include "ui.h"
+#include "rktools.h"
+#include "sdboot.h"
+#include "mtdutils/rk29.h"
+#include "rkavvin/RkAvvinApi.h"
 
 static const struct option OPTIONS[] = {
   { "update_package", required_argument, NULL, 'u' },
@@ -87,9 +92,14 @@ static const struct option OPTIONS[] = {
   { "shutdown_after", no_argument, NULL, 'p' },
   { "reason", required_argument, NULL, 'r' },
   { "security", no_argument, NULL, 'e'},
+  { "wipe_all", no_argument, NULL, 'w'+'a' },
   { "wipe_ab", no_argument, NULL, 0 },
   { "wipe_package_size", required_argument, NULL, 0 },
   { "prompt_and_wipe_data", no_argument, NULL, 0 },
+  { "fw_update", required_argument, NULL, 'f'+'w' },
+  { "factory_mode", required_argument, NULL, 'f' },
+  { "pcba_test", required_argument, NULL, 'p'+'t' },
+  { "resize_partition", required_argument, NULL, 'r'+'p' },
   { NULL, 0, NULL, 0 },
 };
 
@@ -108,8 +118,9 @@ static const char *CONVERT_FBE_DIR = "/tmp/convert_fbe";
 static const char *CONVERT_FBE_FILE = "/tmp/convert_fbe/convert_fbe";
 static const char *CACHE_ROOT = "/cache";
 static const char *DATA_ROOT = "/data";
-static const char *SDCARD_ROOT = "/sdcard";
+static const char *SDCARD_ROOT = "/mnt/external_sd";
 static const char *TEMPORARY_LOG_FILE = "/tmp/recovery.log";
+static const char *SDCARD_LOG_FILE = "/mnt/external_sd/recovery.log";
 static const char *TEMPORARY_INSTALL_FILE = "/tmp/last_install";
 static const char *LAST_KMSG_FILE = "/cache/recovery/last_kmsg";
 static const char *LAST_LOG_FILE = "/cache/recovery/last_log";
@@ -133,6 +144,16 @@ bool modified_flash = false;
 std::string stage;
 const char* reason = nullptr;
 struct selabel_handle* sehandle;
+
+// define for preinstall apk
+#define DELETE_APK_LEN 4*1024
+static char *ppre = NULL;
+static int pre_count = 0;
+static const char *DELETEAPKFILE = "/cache/deleteApkFile.dat";
+
+static char updatepath[128] = "\0";
+bool bAutoUpdateComplete = false;
+static const char *FLAG_FILE = "/cache/recovery/last_flag";
 
 /*
  * The recovery tool communicates with the main system through /cache files.
@@ -501,6 +522,23 @@ static void finish_recovery() {
     LOG(ERROR) << "Failed to clear BCB message: " << err;
   }
 
+  if (bAutoUpdateComplete == true) {
+      //stopLed(ON_VALUE);
+      FILE *fp = fopen_path(FLAG_FILE, "w");
+      if (fp == NULL) {
+          LOG(ERROR) << "Can't open %s\n" << FLAG_FILE;
+      }
+      char strflag[160]="success$path=";
+      strcat(strflag, updatepath);
+      if (fwrite(strflag, 1, sizeof(strflag), fp) != sizeof(strflag)) {
+          LOG(ERROR) << "write %s failed! \n" << FLAG_FILE;
+      }
+      fclose(fp);
+      bAutoUpdateComplete = false;
+  }else{
+      //stopLed(OFF_VALUE);
+  }
+
   // Remove the command file, so recovery won't repeat indefinitely.
   if (has_cache) {
     if (ensure_path_mounted(COMMAND_FILE) != 0 || (unlink(COMMAND_FILE) && errno != ENOENT)) {
@@ -510,6 +548,70 @@ static void finish_recovery() {
   }
 
   sync();  // For good measure.
+}
+
+static int exit_factory_mode_wipe_cmd_in_bcb(void)
+{
+	bootloader_message boot = {};
+	std::string err;
+
+	printf("enter exit_factory_mode_wipe_cmd_in_bcb \n");
+
+	strlcpy(boot.command, "boot-recovery", sizeof(boot.command));
+	strlcpy(boot.recovery, "recovery\n--wipe_all\n", sizeof(boot.recovery));
+	if (!write_bootloader_message(boot, &err)) {
+		printf("exit_factory_mode_wipe_cmd_in_bcb write_bootloader_message failed %s \n",err.c_str());
+	}
+
+	return 0;
+}
+
+static int copyFileToMem(const char *path,char *p,int *count,int size) {
+    char *tmp = p;
+    FILE* fd = fopen_path(path,"r");
+
+    chmod(path,0770);
+    chown(path,1000,1000);
+    if(NULL == fd) {
+        printf("open %s failed %d(%s)\n",path,errno,strerror(errno));
+        return -1;
+    }
+
+    int res = 0;
+    char buf[50] = {0};
+    while((res = fread(buf,1,sizeof(buf),fd)) > 0) {
+        *count += res;
+        if (*count <= size) {
+            memcpy(tmp,buf,res);
+            tmp += res;
+        } else {
+            *count -= res;
+            printf("size overflow");
+            break;
+        }
+    }
+    fclose(fd);
+
+    return 0;
+}
+
+static int copyFileFromMem(const char *path,char *p,int count) {
+    FILE* fd = fopen_path(path,"w+");
+    chmod(path,0770);
+    chown(path,1000,1000);
+
+    if(NULL == fd) {
+        printf("open %s failed %d(%s)\n",path,errno,strerror(errno));
+        return -1;
+    }
+    int res = 0;
+    if ((res = fwrite(p,1,count,fd)) > 0) {
+        printf("write ok\n");
+    }
+
+    fclose(fd);
+
+    return 0;
 }
 
 struct saved_log_file {
@@ -539,7 +641,7 @@ static bool erase_volume(const char* volume) {
     std::unique_ptr<DIR, decltype(&closedir)> d(opendir(CACHE_LOG_DIR), closedir);
     if (d) {
       while ((de = readdir(d.get())) != nullptr) {
-        if (strncmp(de->d_name, "last_", 5) == 0 || strcmp(de->d_name, "log") == 0) {
+        if (strncmp(de->d_name, "last_", 5) == 0 || strcmp(de->d_name, "log") == 0 || strncmp(de->d_name, "Recovery_", 9)==0) {
           std::string path = android::base::StringPrintf("%s/%s", CACHE_LOG_DIR, de->d_name);
 
           struct stat sb;
@@ -745,6 +847,20 @@ static bool ask_to_wipe_data(Device* device) {
 
 // Return true on success.
 static bool wipe_data(Device* device) {
+    {
+        ppre = (char *)malloc(DELETE_APK_LEN);
+        int res;
+        if(NULL == ppre) {
+            printf("malloc failed\n");
+        } else {
+            memset(ppre,0,DELETE_APK_LEN);
+            res = copyFileToMem(DELETEAPKFILE,ppre,&pre_count,DELETE_APK_LEN);
+            if(res < 0) {
+                printf("copyFileToMem failed\n");
+            }
+        }
+    }
+
     modified_flash = true;
 
     ui->Print("\n-- Wiping data...\n");
@@ -753,6 +869,20 @@ static bool wipe_data(Device* device) {
         erase_volume("/data") &&
         (has_cache ? erase_volume("/cache") : true) &&
         device->PostWipeData();
+
+    {
+        if(ppre != NULL) {
+            int res = copyFileFromMem(DELETEAPKFILE,ppre,pre_count);
+            if(res < 0) {
+                printf("copyFileFromMem failed\n");
+            }
+            free(ppre);
+            ppre = NULL;
+        }
+    }
+
+    erase_baseparameter();
+
     ui->Print("Data wipe %s.\n", success ? "complete" : "failed");
     return success;
 }
@@ -980,6 +1110,7 @@ static void choose_recovery_file(Device* device) {
 
 static void run_graphics_test() {
   // Switch to graphics screen.
+  ui->SetBackground(RecoveryUI::NONE);
   ui->ShowText(false);
 
   ui->SetProgressType(RecoveryUI::INDETERMINATE);
@@ -1078,7 +1209,9 @@ static int apply_from_sdcard(Device* device, bool* wipe_cache) {
             }
         }
 
-        result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+        //result = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
+        //                         TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
+        result = install_package("/mnt/external_sd/update.zip", wipe_cache,
                                  TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
         break;
     }
@@ -1099,6 +1232,34 @@ static int apply_from_sdcard(Device* device, bool* wipe_cache) {
     ensure_path_unmounted(SDCARD_ROOT);
     return result;
 }
+
+static int apply_from_usb(Device* device, bool* wipe_cache) {
+	int result = INSTALL_ERROR;
+    int status;
+    modified_flash = true;
+
+	if(is_path_mounted(USB_ROOT) != 0)
+	{
+		check_media_package(USB_ROOT);
+	}
+
+    std::string path = browse_directory(USB_ROOT, device);
+    if (path.empty()) {
+        ui->Print("\n-- No package file selected.\n");
+        ensure_path_unmounted(USB_ROOT);
+        return INSTALL_ERROR;
+    }
+
+    ui->Print("\n-- Install %s ...\n", path.c_str());
+    set_sdcard_update_bootloader_message();
+
+	result = install_package("/mnt/usb_storage/update.zip", wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/);
+
+    ensure_path_unmounted(USB_ROOT);
+    return result;
+}
+
 
 // Returns REBOOT, SHUTDOWN, or REBOOT_BOOTLOADER. Returning NO_ACTION means to take the default,
 // which is to reboot or shutdown depending on if the --shutdown_after flag was passed to recovery.
@@ -1186,6 +1347,35 @@ static Device::BuiltinAction prompt_and_wait(Device* device, int status) {
       case Device::RUN_GRAPHICS_TEST:
         run_graphics_test();
         break;
+
+      case Device::RUN_LOCALE_TEST: {
+        ScreenRecoveryUI* screen_ui = static_cast<ScreenRecoveryUI*>(ui);
+        screen_ui->CheckBackgroundTextImages(locale);
+        break;
+      }
+
+	case Device::APPLY_USB_CARD:
+		{
+           status = apply_from_usb(device, &should_wipe_cache);
+
+		ui->Print("APPLY_USB_CARD.\n");
+          if (status == INSTALL_SUCCESS && should_wipe_cache) {
+            if (!wipe_cache(false, device)) {
+              status = INSTALL_ERROR;
+            }
+          }
+
+          if (status != INSTALL_SUCCESS) {
+            ui->SetBackground(RecoveryUI::ERROR);
+            ui->Print("Installation aborted.\n");
+            copy_logs();
+          } else if (!ui->IsTextVisible()) {
+            return Device::NO_ACTION;  // reboot if logs aren't visible
+          } else {
+            ui->Print("\nInstall from %s complete.\n", "USB card");
+          }
+        }
+		break;
 
       case Device::MOUNT_SYSTEM:
         // For a system image built with the root directory (i.e. system_root_image == "true"), we
@@ -1348,6 +1538,93 @@ static void log_failure_code(ErrorCode code, const char *update_package) {
     LOG(INFO) << log_content;
 }
 
+void SureMetadataMount() {
+    if (ensure_path_mounted("/metadata")) {
+        printf("mount metadata fail,so formate...\n");
+        tmplog_offset = 0;
+        format_volume("/metadata");
+        ensure_path_mounted("/metadata");
+    }
+}
+
+static int is_boot_from_sd(){
+    char param[1024];
+    int fd, ret;
+    char *s=NULL;
+	int is_sd_boot = 0;
+
+    memset(param,0,1024);
+    fd= open("/proc/cmdline", O_RDONLY);
+    ret = read(fd, (char*)param, 1024);
+
+    s = strstr(param,"storagemedia=sd");
+    if(s != NULL){
+        is_sd_boot = 1;
+    }else{
+        is_sd_boot = 0;
+    }
+
+    close(fd);
+
+	printf("is_boot_from_sd is_sd_boot=%d \n", is_sd_boot);
+	return is_sd_boot;
+}
+
+static int try_do_sdcard_boot(int* stat)
+{
+	int is_sd_mounted = 0;
+	unsigned long i = 0;
+	int is_sdupdate = 0;
+
+	printf("enter try_do_sdcard_boot \n");
+	if(NULL == stat){
+		printf("try_do_sdcard_boot stat is NULL! \n");
+		return 0;
+	}
+	is_sd_mounted = 0;
+	is_sdupdate = 0;
+	if(is_boot_from_sd())
+	{
+		/*try mount sdcard*/
+	    for(i = 0; i < 3; i++) {
+	        if(0 == ensure_path_mounted(EX_SDCARD_ROOT)){
+	            is_sd_mounted = 1;
+	            break;
+	        }else {
+	            printf("try_do_sdcard_boot delay 1sec\n");
+	            sleep(1);
+	        }
+	    }
+
+		printf("try_do_sdcard_boot is_sd_mounted=%d \n", is_sd_mounted);
+		if(is_sd_mounted)
+		{
+			/*check if it's fw_update or not*/
+			VEC_SD_CONFIG vecItem;
+			SDBoot rksdboot;
+
+			if (!rksdboot.do_direct_parse_config_file("/mnt/external_sd/sd_boot_config.config",vecItem)){
+				printf("try_do_sdcard_boot sd_parse_config_file failed \n");
+			}
+			else
+			{
+				    for (i=0;i<vecItem.size();i++) {
+				        if ((strcmp(vecItem[i].strKey.c_str(),"fw_update")==0)){
+				            if (strcmp(vecItem[i].strValue.c_str(),"0")!=0){
+								printf("try_do_sdcard_boot vecItem[i].strValue.c_str()=%s \n", vecItem[i].strValue.c_str());
+								*stat = rksdboot.do_rk_direct_sd_update(vecItem[i].strValue.c_str());
+								is_sdupdate = 1;
+				            }
+				        }
+				    }
+			}
+		}
+	}
+
+	printf("try_do_sdcard_boot is done,  is_sdupdate=%d *stat=%d \n", is_sdupdate, *stat);
+	return is_sdupdate;
+}
+
 int main(int argc, char **argv) {
     // We don't have logcat yet under recovery; so we'll print error on screen and
     // log to stdout (which is redirected to recovery.log) as we used to do.
@@ -1382,20 +1659,47 @@ int main(int argc, char **argv) {
 
     // redirect_stdio should be called only in non-sideload mode. Otherwise
     // we may have two logger instances with different timestamps.
+#ifdef LogToCache
     redirect_stdio(TEMPORARY_LOG_FILE);
+#endif
 
+#ifdef LogToSerial
+    char *SerialName = getSerial();
+	//ui->Print("SerialName: %s\n", SerialName);
+    freopen(SerialName, "a", stdout); setbuf(stdout, NULL);
+    freopen(SerialName, "a", stderr); setbuf(stderr, NULL);
+    free(SerialName);
+#endif
+    
+    int n = player_ext_init();
     printf("Starting recovery (pid %d) on %s", getpid(), ctime(&start));
-
     load_volume_table();
+    setFlashPoint();
+    SDBoot rksdboot;
+		// todo noneed wipe cache in bringup 
     has_cache = volume_for_path(CACHE_ROOT) != nullptr;
 
-    std::vector<std::string> args = get_args(argc, argv);
+    std::vector<std::string> args;
+    if(rksdboot.isSDboot() || rksdboot.isUSBboot()){
+        args = rksdboot.get_args(argc, argv);
+    }else{
+        args = get_args(argc, argv);
+    }
+
     std::vector<char*> args_to_parse(args.size());
     std::transform(args.cbegin(), args.cend(), args_to_parse.begin(),
                    [](const std::string& arg) { return const_cast<char*>(arg.c_str()); });
 
+#ifdef LogToSDCard
+    rksdboot.ensure_sd_mounted();
+    redirect_stdio(SDCARD_LOG_FILE);
+#endif
+
     const char *update_package = NULL;
+    const char *factory_mode = NULL;
+    char *sdboot_update_package = NULL;
     bool should_wipe_data = false;
+    bool should_wipe_all = false;
     bool should_prompt_and_wipe_data = false;
     bool should_wipe_cache = false;
     bool should_wipe_ab = false;
@@ -1407,9 +1711,12 @@ int main(int argc, char **argv) {
     bool shutdown_after = false;
     int retry_count = 0;
     bool security_update = false;
+    const char *resize_partition_path = NULL;
+    int resize_partition = 0;
 
     int arg;
     int option_index;
+	int exit_from_factory = 0;
     while ((arg = getopt_long(args_to_parse.size(), args_to_parse.data(), "", OPTIONS,
                               &option_index)) != -1) {
         switch (arg) {
@@ -1425,6 +1732,10 @@ int main(int argc, char **argv) {
         case 'p': shutdown_after = true; break;
         case 'r': reason = optarg; break;
         case 'e': security_update = true; break;
+        case 'w'+'a': { should_wipe_all = true; should_wipe_data = true; should_wipe_cache = true;} break;
+        case 'f': factory_mode = optarg; break;
+        case 'p'+'t': factory_mode = optarg; break;
+        case 'r'+'p': { resize_partition = 1; printf("resize_partition = 1!\n");} break;
         case 0: {
             std::string option = OPTIONS[option_index].name;
             if (option == "wipe_ab") {
@@ -1436,6 +1747,11 @@ int main(int argc, char **argv) {
             }
             break;
         }
+        case 'f'+'w': //fw_update
+            if((optarg)&&(!sdboot_update_package)){
+                sdboot_update_package = strdup(optarg);
+            }
+            break;
         case '?':
             LOG(ERROR) << "Invalid command argument";
             continue;
@@ -1489,6 +1805,8 @@ int main(int argc, char **argv) {
 
     device->StartRecovery();
 
+    SureMetadataMount();
+
     printf("Command:");
     for (const auto& arg : args) {
         printf(" \"%s\"", arg.c_str());
@@ -1503,6 +1821,7 @@ int main(int argc, char **argv) {
     int status = INSTALL_SUCCESS;
 
     if (update_package != NULL) {
+        strcpy(updatepath, update_package);
         // It's not entirely true that we will modify the flash. But we want
         // to log the update attempt since update_package is non-NULL.
         modified_flash = true;
@@ -1520,7 +1839,10 @@ int main(int argc, char **argv) {
             log_failure_code(kBootreasonInBlacklist, update_package);
             status = INSTALL_SKIPPED;
         } else {
-            status = install_package(update_package, &should_wipe_cache,
+            const char *reallyPath = check_media_package(update_package);
+            if(reallyPath == NULL)
+                reallyPath = update_package;
+            status = install_package(reallyPath, &should_wipe_cache,
                                      TEMPORARY_INSTALL_FILE, true, retry_count);
             if (status == INSTALL_SUCCESS && should_wipe_cache) {
                 wipe_cache(false, device);
@@ -1550,12 +1872,41 @@ int main(int argc, char **argv) {
                 if (is_ro_debuggable()) {
                     ui->ShowText(true);
                 }
+            }else if(status == INSTALL_SUCCESS){
+                bAutoUpdateComplete = true;
             }
         }
-    } else if (should_wipe_data) {
-        if (!wipe_data(device)) {
-            status = INSTALL_ERROR;
+    } else if (sdboot_update_package != NULL) {
+        printf("bSDBoot = %d, sdboot_update_package=%s\n", rksdboot.isSDboot(), sdboot_update_package);
+        status = rksdboot.do_rk_mode_update(sdboot_update_package);
+    } else if (should_wipe_data || resize_partition) {
+        if (resize_partition !=1) {
+            if (!wipe_data(device)) {
+                status = INSTALL_ERROR;
+            }
+        } else {
+            printf("resize /data \n");
+            ui->Print("resize /data \n");
+            Volume* v11 = volume_for_path("/data");
+            if(rk_check_and_resizefs(v11->blk_device)) {
+                ui->Print("check and resize /data failed!\n");
+                status = INSTALL_ERROR;
+            }
         }
+        if (should_wipe_all) {
+            printf("begin to wipe frp partion!\n");
+            int ret;
+            ret = format_volume("/frp");
+            if(ret<0){
+               printf("wiping frp failed!\n");
+            } else {
+                printf("wiping frp success!\n");
+            }
+        }
+    } else if (factory_mode != NULL){
+        status = rksdboot.do_rk_factory_mode();
+		printf("do_factory_mode status=%d factory_mode=%s \n", status, factory_mode);
+		exit_from_factory = 1;
     } else if (should_prompt_and_wipe_data) {
         ui->ShowText(true);
         ui->SetBackground(RecoveryUI::ERROR);
@@ -1595,19 +1946,35 @@ int main(int argc, char **argv) {
       // If this is an eng or userdebug build, automatically turn on the text display if no command
       // is specified. Note that this should be called before setting the background to avoid
       // flickering the background image.
-      if (is_ro_debuggable()) {
-        ui->ShowText(true);
-      }
-      status = INSTALL_NONE;  // No command specified
-      ui->SetBackground(RecoveryUI::NO_COMMAND);
+
+	  //try to do sdcard boot
+	  if (try_do_sdcard_boot(&status)){
+	  	printf("try_do_sdcard_boot is actually do sdupdate status=%d \n", status);
+	  }
+	  else
+	  {
+	      if (is_ro_debuggable()) {
+	        ui->ShowText(true);
+	      }
+	      status = INSTALL_NONE;  // No command specified
+	      ui->SetBackground(RecoveryUI::NO_COMMAND);
+	  }
     }
 
-    if (status == INSTALL_ERROR || status == INSTALL_CORRUPT) {
-        ui->SetBackground(RecoveryUI::ERROR);
-        if (!ui->IsTextVisible()) {
-            sleep(5);
-        }
-    }
+	if(exit_from_factory)
+	{
+		//DO Nothing for now
+		printf("exit from pcba okay exit_from_factory=%d \n", exit_from_factory);
+	}
+	else
+	{
+	    if (status == INSTALL_ERROR || status == INSTALL_CORRUPT) {
+	        ui->SetBackground(RecoveryUI::ERROR);
+	        if (!ui->IsTextVisible()) {
+	            sleep(5);
+	        }
+	    }
+	}
 
     Device::BuiltinAction after = shutdown_after ? Device::SHUTDOWN : Device::REBOOT;
     // 1. If the recovery menu is visible, prompt and wait for commands.
@@ -1617,15 +1984,29 @@ int main(int argc, char **argv) {
     //    without waiting.
     // 4. In all other cases, reboot the device. Therefore, normal users will observe the device
     //    reboot after it shows the "error" screen for 5s.
-    if ((status == INSTALL_NONE && !sideload_auto_reboot) || ui->IsTextVisible()) {
-        Device::BuiltinAction temp = prompt_and_wait(device, status);
-        if (temp != Device::NO_ACTION) {
-            after = temp;
-        }
-    }
+    if(exit_from_factory)
+	{
+		//DO Nothing for now
+		printf("exit from pcba okay exit_from_factory=%d \n", exit_from_factory);
+	}
+	else
+	{
+	    if ((status == INSTALL_NONE && !sideload_auto_reboot) || ui->IsTextVisible()) {
+	        Device::BuiltinAction temp = prompt_and_wait(device, status);
+	        if (temp != Device::NO_ACTION) {
+	            after = temp;
+	        }
+	    }
+	}
 
+    rksdboot.check_device_remove();
     // Save logs and clean up before rebooting or shutting down.
     finish_recovery();
+
+	if(exit_from_factory)
+	{
+		exit_factory_mode_wipe_cmd_in_bcb();
+	}
 
     switch (after) {
         case Device::SHUTDOWN:

@@ -66,6 +66,8 @@ class Device {
     VIEW_RECOVERY_LOGS = 9,
     MOUNT_SYSTEM = 10,
     RUN_GRAPHICS_TEST = 11,
+    RUN_LOCALE_TEST = 12,
+    APPLY_USB_CARD = 13,
   };
 
   // Return the list of menu items (an array of strings, NULL-terminated). The menu_position passed

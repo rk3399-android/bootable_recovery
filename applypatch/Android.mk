@@ -21,7 +21,8 @@ LOCAL_SRC_FILES := \
     applypatch.cpp \
     bspatch.cpp \
     freecache.cpp \
-    imgpatch.cpp
+    imgpatch.cpp \
+    ../rktools.cpp
 LOCAL_MODULE := libapplypatch
 LOCAL_MODULE_TAGS := eng
 LOCAL_C_INCLUDES := \
@@ -34,10 +35,10 @@ LOCAL_STATIC_LIBRARIES := \
     libcrypto \
     libbspatch \
     libbz \
-    libz
+    libz \
+    libfs_mgr
 LOCAL_CFLAGS := \
-    -DZLIB_CONST \
-    -Werror
+    -DZLIB_CONST
 include $(BUILD_STATIC_LIBRARY)
 
 # libimgpatch (static library)

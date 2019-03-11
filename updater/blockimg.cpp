@@ -56,6 +56,7 @@
 #include "updater/install.h"
 #include "updater/rangeset.h"
 #include "updater/updater.h"
+#include "rktools.h"
 
 // Set this to 0 to interpret 'erase' transfers to mean do a
 // BLKDISCARD ioctl (the normal behavior).  Set to 1 to interpret
@@ -1415,10 +1416,14 @@ static Value* PerformBlockImageUpdate(const char* name, State* state,
     return nullptr;
   }
 
-  const std::unique_ptr<Value>& blockdev_filename = args[0];
+  const std::unique_ptr<Value>& blockdev_filename_tmp = args[0];
   const std::unique_ptr<Value>& transfer_list_value = args[1];
   const std::unique_ptr<Value>& new_data_fn = args[2];
   const std::unique_ptr<Value>& patch_data_fn = args[3];
+  std::string result;
+  SplitString(blockdev_filename_tmp->data, result, "/");
+  blockdev_filename_tmp->data = result;
+  const std::unique_ptr<Value>& blockdev_filename = blockdev_filename_tmp;
 
   if (blockdev_filename->type != VAL_STRING) {
     ErrorAbort(state, kArgsParsingFailure, "blockdev_filename argument to %s must be string", name);
@@ -1728,9 +1733,13 @@ Value* RangeSha1Fn(const char* name, State* state, const std::vector<std::unique
     return nullptr;
   }
 
-  const std::unique_ptr<Value>& blockdev_filename = args[0];
+  const std::unique_ptr<Value>& blockdev_filename_tmp = args[0];
+  std::string result;
+  SplitString(blockdev_filename_tmp->data, result, "/");
+  blockdev_filename_tmp->data = result;
+  const std::unique_ptr<Value>& blockdev_filename = blockdev_filename_tmp;
   const std::unique_ptr<Value>& ranges = args[1];
-
+  
   if (blockdev_filename->type != VAL_STRING) {
     ErrorAbort(state, kArgsParsingFailure, "blockdev_filename argument to %s must be string", name);
     return StringValue("");
@@ -1794,7 +1803,11 @@ Value* CheckFirstBlockFn(const char* name, State* state,
     return nullptr;
   }
 
-  const std::unique_ptr<Value>& arg_filename = args[0];
+  const std::unique_ptr<Value>& arg_filename_tmp = args[0];
+  std::string result;
+  SplitString(arg_filename_tmp->data, result, "/");
+  arg_filename_tmp->data = result;
+  const std::unique_ptr<Value>& arg_filename = arg_filename_tmp;
 
   if (arg_filename->type != VAL_STRING) {
     ErrorAbort(state, kArgsParsingFailure, "filename argument to %s must be string", name);

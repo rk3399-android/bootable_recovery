@@ -73,6 +73,8 @@ LOCAL_SRC_FILES := \
     device.cpp \
     fuse_sdcard_provider.cpp \
     recovery.cpp \
+    rktools.cpp \
+    sdboot.cpp \
     roots.cpp \
     rotate_logs.cpp \
     screen_ui.cpp \
@@ -83,6 +85,27 @@ LOCAL_SRC_FILES := \
 LOCAL_MODULE := recovery
 
 LOCAL_FORCE_STATIC_EXECUTABLE := true
+
+#redirect to SDCARD¡¢CACHE¡¢UART
+#SDCARD: save log to sdcard
+#CACHE: save log to /cache/recovery/ dir
+#UART: redirect log to uart output
+REDIRECT_LOG_TO := UART
+
+ifeq ($(strip $(REDIRECT_LOG_TO)),SDCARD)
+  $(warning *** Redirect log to SDCARD)
+  LOCAL_CFLAGS += -DLogToSDCard
+endif
+
+ifeq ($(strip $(REDIRECT_LOG_TO)),UART)
+  $(warning *** Redirect log to UART)
+  LOCAL_CFLAGS += -DLogToSerial
+endif
+
+ifeq ($(strip $(REDIRECT_LOG_TO)),CACHE)
+  $(warning *** Redirect log to CACHE)
+  LOCAL_CFLAGS += -DLogToCache
+endif
 
 LOCAL_REQUIRED_MODULES := e2fsdroid_static mke2fs_static mke2fs.conf
 
@@ -160,6 +183,7 @@ LOCAL_STATIC_LIBRARIES := \
     libz \
     libminadbd \
     libfusesideload \
+    libmtdutils \
     libminui \
     libpng \
     libcrypto_utils \
@@ -168,12 +192,16 @@ LOCAL_STATIC_LIBRARIES := \
     libvintf \
     libtinyxml2 \
     libbase \
+    libavvin \
     libcutils \
     libutils \
     liblog \
     libselinux \
     libm \
-    libc
+    libc \
+    librkupdate \
+    librkrsa \
+    libext2_uuid
 
 LOCAL_HAL_STATIC_LIBRARIES := libhealthd
 
@@ -266,3 +294,7 @@ include \
     $(LOCAL_PATH)/uncrypt/Android.mk \
     $(LOCAL_PATH)/updater/Android.mk \
     $(LOCAL_PATH)/update_verifier/Android.mk \
+    $(LOCAL_PATH)/rkupdate/update/Android.mk \
+    $(LOCAL_PATH)/rkupdate/rsa/Android.mk \
+    $(LOCAL_PATH)/mtdutils/Android.mk \
+    $(LOCAL_PATH)/rkavvin/avvin/Android.mk
